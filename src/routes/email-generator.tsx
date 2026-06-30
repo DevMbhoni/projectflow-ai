@@ -10,7 +10,15 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { useStore } from "@/lib/store";
 import { Sparkles, Copy, Mail, Info } from "lucide-react";
 import { toast } from "sonner";
-import { DISCLAIMER, NOT_SPECIFIED, splitSentences, keywords } from "@/lib/ai-helpers";
+import {
+  DISCLAIMER,
+  NOT_SPECIFIED,
+  splitSentences,
+  dedupe,
+  extractDeadline,
+  properNouns,
+  sentenceTopic,
+} from "@/lib/ai-helpers";
 
 export const Route = createFileRoute("/email-generator")({
   head: () => ({
@@ -31,6 +39,36 @@ interface EmailDraft {
   signature: string;
 }
 
+// Convert a purpose phrase into a natural verb phrase that fits inside a sentence.
+const purposeToPhrase = (raw: string): string => {
+  let p = raw.trim().replace(/[.!?]+$/, "");
+  // Strip imperative leads: "Share a project status update" → "a project status update"
+  p = p.replace(/^(share|send|provide|give|write|draft|deliver|present|announce)\s+(an?\s+|the\s+)?/i, "");
+  return p.charAt(0).toLowerCase() + p.slice(1);
+};
+
+// Build a natural subject line from the actual situation.
+const buildSubject = (purpose: string, details: string, tone: string, sentences: string[]): string => {
+  const subject = purpose.trim().replace(/[.!?]+$/, "");
+  // Find a concrete anchor: a project name (capitalized noun) or a key noun phrase from details.
+  const nouns = properNouns(details).filter((n) => n.length > 2);
+  const anchor = nouns[0];
+  const deadline = sentences.map((s) => extractDeadline(s)).find(Boolean);
+
+  if (tone === "apologetic") {
+    return anchor ? `Apologies and next steps — ${anchor}` : `Apologies and next steps — ${subject}`;
+  }
+  if (tone === "persuasive") {
+    return anchor ? `${subject} — ${anchor}` : subject;
+  }
+  if (tone === "concise") {
+    return anchor ? `${subject}: ${anchor}` : subject;
+  }
+  if (deadline && anchor) return `${subject} — ${anchor} (${deadline})`;
+  if (anchor) return `${subject} — ${anchor}`;
+  return subject;
+};
+
 function EmailPage() {
   const { addOutput } = useStore();
   const [purpose, setPurpose] = useState("Share a project status update");
@@ -38,7 +76,7 @@ function EmailPage() {
   const [audience, setAudience] = useState("client");
   const [tone, setTone] = useState("formal");
   const [details, setDetails] = useState(
-    "Acme website redesign is on track. Wireframes shipped this week. Next milestone is the high-fidelity design review on July 12.",
+    "Acme website redesign is on track. Wireframes shipped this week. High-fidelity design review is scheduled for July 12. Awaiting brand guidelines from the marketing team — could block dev hand-off if not received by Friday.",
   );
   const [senderName, setSenderName] = useState("Alex Morgan");
   const [out, setOut] = useState<EmailDraft | null>(null);
@@ -46,25 +84,12 @@ function EmailPage() {
   const generate = () => {
     if (!purpose.trim() || !details.trim()) return toast.error("Add a purpose and key details");
 
-    const sentences = splitSentences(details);
-    const kw = keywords(details, 5);
-    const purposeShort = purpose.replace(/\.$/, "").trim();
-    const recipient = recipientName.trim() || (audience === "team" ? "team" : audience);
+    const sentences = dedupe(splitSentences(details));
+    const purposePhrase = purposeToPhrase(purpose);
     const recipientDisplay = recipientName.trim() || NOT_SPECIFIED;
 
-    // Subject lines tuned by tone, referencing actual content
-    const subject =
-      tone === "concise"
-        ? purposeShort
-        : tone === "persuasive"
-          ? `${purposeShort} — worth a quick look`
-          : tone === "apologetic"
-            ? `Apology and update: ${purposeShort}`
-            : tone === "friendly"
-              ? `${purposeShort} 👋`
-              : `${purposeShort}${kw[0] ? ` — ${kw[0]}` : ""}`;
+    const subject = buildSubject(purpose, details, tone, sentences);
 
-    // Greeting
     const namePart =
       recipientName.trim() ||
       (audience === "team"
@@ -79,45 +104,102 @@ function EmailPage() {
             ? `Hi ${namePart},`
             : `Hello ${namePart},`;
 
-    // Opener
-    const opener =
-      tone === "apologetic"
-        ? `I wanted to reach out personally regarding ${purposeShort.toLowerCase()} — and to apologize for any disruption this may have caused.`
-        : tone === "persuasive"
-          ? `I'm writing because there's a meaningful opportunity tied to ${purposeShort.toLowerCase()} that I think is worth your time.`
-          : tone === "friendly"
-            ? `Hope you're doing well! Quick note about ${purposeShort.toLowerCase()}.`
-            : tone === "concise"
-              ? `Quick note on ${purposeShort.toLowerCase()}.`
-              : `I wanted to share an update regarding ${purposeShort.toLowerCase()}.`;
+    // Classify the details into status / issue / next-step sentences so the body reads naturally.
+    const issues = sentences.filter((s) => /\b(awaiting|waiting|blocked|delay|delayed|risk|issue|concern|pending|missing|behind)\b/i.test(s));
+    const completions = sentences.filter((s) => /\b(shipped|completed|done|delivered|launched|signed off|approved|merged|on track)\b/i.test(s));
+    const upcoming = sentences.filter((s) => /\b(scheduled|next|upcoming|will|going to|plan to|due)\b/i.test(s));
+    const other = sentences.filter((s) => !issues.includes(s) && !completions.includes(s) && !upcoming.includes(s));
 
-    // Body: turn each user-provided sentence into its own paragraph or bullet
-    const body: string[] = [opener];
-    if (sentences.length > 1 && tone !== "concise") {
-      body.push("Here's where things stand:");
-      body.push(sentences.map((s) => `• ${s}`).join("\n"));
+    const body: string[] = [];
+
+    // Opener — natural, doesn't echo the purpose verbatim.
+    if (tone === "apologetic") {
+      const issueTopic = issues[0] ? sentenceTopic(issues[0]).replace(/\.$/, "") : purposePhrase;
+      body.push(`I want to acknowledge ${issueTopic}, and apologize for the impact this has had.`);
+    } else if (tone === "persuasive") {
+      body.push(`I'm writing to flag ${purposePhrase} — there's a clear benefit to acting on this now, and a real cost to waiting.`);
+    } else if (tone === "friendly") {
+      body.push(`Hope you're doing well. Wanted to give you a quick update on ${purposePhrase}.`);
+    } else if (tone === "concise") {
+      body.push(`Short update on ${purposePhrase}:`);
     } else {
-      body.push(sentences.join(" "));
+      body.push(`I'm writing with an update on ${purposePhrase}.`);
     }
 
-    // CTA tuned by tone + audience
-    const cta =
-      tone === "persuasive"
-        ? `Could we set up 15 minutes this week to discuss next steps on ${kw[0] ?? "this"}?`
-        : tone === "apologetic"
-          ? `Please let me know how you'd like to proceed, and I'll prioritize accordingly.`
-          : tone === "concise"
-            ? `Let me know if anything needs adjusting.`
-            : tone === "friendly"
-              ? `Let me know if you have any questions or want to jump on a quick call!`
-              : audience === "stakeholder"
-                ? `Please advise if any aspect requires further detail before our next review.`
-                : `Happy to walk through any of the above in more detail — just let me know what works.`;
+    // Tone-shaped body sections.
+    if (tone === "apologetic") {
+      if (issues.length) {
+        body.push("Here's what happened:");
+        body.push(issues.map((s) => `• ${s.replace(/[.!?]?$/, ".")}`).join("\n"));
+      }
+      if (completions.length || upcoming.length) {
+        body.push("To get back on track:");
+        body.push([...completions, ...upcoming].map((s) => `• ${s.replace(/[.!?]?$/, ".")}`).join("\n"));
+      }
+    } else if (tone === "persuasive") {
+      if (completions.length) {
+        body.push("What we've already delivered:");
+        body.push(completions.map((s) => `• ${s.replace(/[.!?]?$/, ".")}`).join("\n"));
+      }
+      if (issues.length) {
+        body.push("Risk of delay:");
+        body.push(issues.map((s) => `• ${s.replace(/[.!?]?$/, ".")}`).join("\n"));
+      }
+      if (upcoming.length) {
+        body.push("What we'd unlock by moving now:");
+        body.push(upcoming.map((s) => `• ${s.replace(/[.!?]?$/, ".")}`).join("\n"));
+      }
+    } else if (tone === "concise") {
+      const all = [...completions, ...issues, ...upcoming, ...other];
+      if (all.length) body.push(all.map((s) => `• ${s.replace(/[.!?]?$/, ".")}`).join("\n"));
+    } else {
+      // formal / friendly
+      if (completions.length) {
+        body.push(tone === "friendly" ? "What's done:" : "Progress to date:");
+        body.push(completions.map((s) => `• ${s.replace(/[.!?]?$/, ".")}`).join("\n"));
+      }
+      if (upcoming.length) {
+        body.push(tone === "friendly" ? "What's next:" : "Upcoming milestones:");
+        body.push(upcoming.map((s) => `• ${s.replace(/[.!?]?$/, ".")}`).join("\n"));
+      }
+      if (issues.length) {
+        body.push(tone === "friendly" ? "One thing to flag:" : "Items needing attention:");
+        body.push(issues.map((s) => `• ${s.replace(/[.!?]?$/, ".")}`).join("\n"));
+      }
+      if (other.length && tone !== "friendly") {
+        body.push("Additional context:");
+        body.push(other.map((s) => `• ${s.replace(/[.!?]?$/, ".")}`).join("\n"));
+      }
+    }
+
+    // CTA — derived from the actual situation.
+    let cta: string;
+    if (tone === "apologetic") {
+      const fix = upcoming[0] ? sentenceTopic(upcoming[0]).replace(/\.$/, "") : "the corrective steps above";
+      cta = `I'll personally drive ${fix}. Please tell me if there's anything else you'd like us to prioritize.`;
+    } else if (tone === "persuasive") {
+      const ask = issues[0]
+        ? `confirm we can proceed before this slips further`
+        : `confirm next steps so we can move forward this week`;
+      cta = `Could we take 15 minutes this week to ${ask}?`;
+    } else if (tone === "concise") {
+      cta = issues.length
+        ? `Please reply with any blockers on your side.`
+        : `Reply if anything needs adjusting; otherwise we'll proceed as above.`;
+    } else if (tone === "friendly") {
+      cta = issues.length
+        ? `Let me know if you can help unblock the item above — happy to jump on a quick call.`
+        : `Let me know if you have any questions on the above!`;
+    } else if (audience === "stakeholder") {
+      cta = `Please advise if any item requires further detail ahead of the next checkpoint.`;
+    } else {
+      cta = `Happy to walk through any of the above in more detail — let me know what works.`;
+    }
 
     const closingMap: Record<string, string> = {
       formal: "Kind regards,",
-      friendly: "Thanks so much,",
-      persuasive: "Looking forward to your thoughts,",
+      friendly: "Thanks,",
+      persuasive: "Looking forward to your reply,",
       apologetic: "With appreciation,",
       concise: "Best,",
     };

@@ -23,18 +23,25 @@ export const Route = createFileRoute("/ai-planner")({
   component: PlannerPage,
 });
 
+type Bucket = "Do first" | "Schedule today" | "Schedule later" | "Delegate" | "Defer";
+
 interface ParsedTask {
   task: string;
-  due: string;
+  dueRaw: string;     // user's original phrase
+  dueLabel: string;   // friendly label e.g. "Due: Friday" or "No deadline"
   prio: string;
   hours: number;
+  daysToDue: number;  // estimated days; Infinity if unknown
   score: number;
-  daysToDue: number;
 }
 
+interface ScheduleBlock { slot: string; task: string; hours: number }
+interface PrioritizedItem { task: string; reason: string; bucket: Bucket; due: string; hours: number }
+
 interface Plan {
-  prioritized: { task: string; reason: string; bucket: string; due: string; hours: number }[];
-  schedule: { slot: string; task: string }[];
+  prioritized: PrioritizedItem[];
+  schedule: ScheduleBlock[];
+  capacity: { total: number; used: number; required: number; fits: string[]; movedLater: string[] };
   tips: string[];
   risks: string[];
   nextSteps: string[];
@@ -44,22 +51,25 @@ const prioScore = (p: string) =>
   p.includes("critical") ? 4 : p.includes("high") ? 3 : p.includes("medium") || p.includes("med") ? 2 : 1;
 
 const parseDueToDays = (s: string): number => {
-  const lower = s.toLowerCase();
-  if (/today|eod/.test(lower)) return 0;
-  if (/tomorrow/.test(lower)) return 1;
+  const lower = s.toLowerCase().trim();
+  if (!lower || lower === "n/a" || lower === "none") return Infinity;
+  if (/\btoday\b|\beod\b/.test(lower)) return 0;
+  if (/\btomorrow\b/.test(lower)) return 1;
+  const iso = s.match(/\d{4}-\d{2}-\d{2}/);
+  if (iso) return Math.max(0, Math.round((new Date(iso[0]).getTime() - Date.now()) / 86400000));
   const wd = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
-  const idx = wd.findIndex((d) => lower.includes(d));
+  const isNext = /\bnext\b/.test(lower);
+  const idx = wd.findIndex((d) => new RegExp(`\\b${d}\\b|\\b${d.slice(0,3)}\\b`).test(lower));
   if (idx >= 0) {
     const today = new Date().getDay();
     let diff = idx - today;
     if (diff <= 0) diff += 7;
+    if (isNext) diff += 7;
     return diff;
   }
-  const iso = s.match(/\d{4}-\d{2}-\d{2}/);
-  if (iso) return Math.max(0, Math.round((new Date(iso[0]).getTime() - Date.now()) / 86400000));
-  if (/this week|eow|end of week/.test(lower)) return 4;
-  if (/next week/.test(lower)) return 9;
-  return 7;
+  if (/\bthis week\b|\beow\b|\bend of week\b/.test(lower)) return 4;
+  if (/\bnext week\b/.test(lower)) return 9;
+  return Infinity;
 };
 
 const parseHours = (s: string): number => {
@@ -67,10 +77,25 @@ const parseHours = (s: string): number => {
   return m ? parseFloat(m[1]) : 2;
 };
 
+const titleCaseDue = (raw: string): string => {
+  const trimmed = raw.trim();
+  if (!trimmed) return NOT_SPECIFIED;
+  return trimmed
+    .split(/\s+/)
+    .map((w) => (w.length > 2 ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : w.toLowerCase()))
+    .join(" ");
+};
+
+// Format hours as "1h", "1.5h", "30m"
+const fmtHours = (h: number): string => {
+  if (h < 1) return `${Math.round(h * 60)}m`;
+  return Number.isInteger(h) ? `${h}h` : `${h}h`;
+};
+
 function PlannerPage() {
   const { addOutput } = useStore();
   const [tasks, setTasks] = useState(
-    "Finalize homepage wireframes — Fri — high — 4h\nDraft Q3 launch emails — Wed — medium — 2h\nReview CRM data audit — Mon — medium — 1.5h\nPrep Northwind demo deck — Thu — critical — 3h",
+    "Finalize homepage wireframes — Friday — high — 4h\nDraft Q3 launch emails — Wednesday — medium — 2h\nReview CRM data audit — Monday — medium — 1.5h\nPrep Northwind demo deck — tomorrow — critical — 3h",
   );
   const [importance, setImportance] = useState("high");
   const [hours, setHours] = useState(6);
@@ -83,106 +108,156 @@ function PlannerPage() {
       .map((l) => l.trim())
       .filter(Boolean)
       .map((line) => {
-        const parts = line.split(/[—–-]/).map((s) => s.trim());
+        const parts = line.split(/\s+[—–-]\s+/).map((s) => s.trim());
         const t = parts[0] || line;
-        const due = parts[1] || NOT_SPECIFIED;
+        const dueRaw = parts[1] || "";
         const prio = (parts[2] || importance).toLowerCase();
         const hoursStr = parts[3] || "";
         const h = parseHours(hoursStr);
-        const daysToDue = due === NOT_SPECIFIED ? 7 : parseDueToDays(due);
-        const urgencyBoost = daysToDue <= 1 ? 2 : daysToDue <= 3 ? 1 : 0;
-        return { task: t, due, prio, hours: h, daysToDue, score: prioScore(prio) * 2 + urgencyBoost };
+        const daysToDue = dueRaw ? parseDueToDays(dueRaw) : Infinity;
+        const dueLabel = dueRaw ? `Due: ${titleCaseDue(dueRaw)}` : "No deadline set";
+        // Urgency-first scoring: urgency dominates importance.
+        let urgency = 0;
+        if (daysToDue === 0) urgency = 5;
+        else if (daysToDue === 1) urgency = 4;
+        else if (daysToDue <= 3) urgency = 3;
+        else if (daysToDue <= 7) urgency = 2;
+        else if (Number.isFinite(daysToDue)) urgency = 1;
+        const score = urgency * 3 + prioScore(prio) - Math.min(h, 4) * 0.1;
+        return { task: t, dueRaw, dueLabel, prio, hours: h, daysToDue, score };
       })
       .sort((a, b) => b.score - a.score);
 
     if (items.length === 0) return toast.error("Add at least one task");
 
-    const bucketFor = (it: ParsedTask): string => {
-      if (it.score >= 7) return "Do first";
-      if (it.score >= 5) return "Schedule";
-      if (it.score >= 3) return "Delegate";
-      return "Defer";
+    const bucketFor = (it: ParsedTask): Bucket => {
+      const pri = prioScore(it.prio);
+      if (it.daysToDue <= 1 && pri >= 3) return "Do first";
+      if (it.daysToDue <= 1) return "Schedule today";
+      if (it.daysToDue <= 3 && pri >= 3) return "Schedule today";
+      if (it.daysToDue <= 7) return "Schedule later";
+      if (pri <= 1 && (it.daysToDue > 7 || !Number.isFinite(it.daysToDue))) return "Defer";
+      if (pri <= 2 && it.hours >= 4) return "Delegate";
+      return "Schedule later";
     };
 
     const reasonFor = (it: ParsedTask): string => {
       const urgency =
         it.daysToDue === 0
-          ? `due today`
+          ? "due today"
           : it.daysToDue === 1
-            ? `due tomorrow`
-            : it.due === NOT_SPECIFIED
-              ? `no deadline set`
-              : `due in ${it.daysToDue} day${it.daysToDue === 1 ? "" : "s"} (${it.due})`;
-      return `${it.prio} priority, ${urgency}, ~${it.hours}h of effort.`;
+            ? "due tomorrow"
+            : !Number.isFinite(it.daysToDue)
+              ? "no deadline set"
+              : `${it.dueLabel.replace(/^Due:\s*/, "due ")}`;
+      return `${it.prio.charAt(0).toUpperCase() + it.prio.slice(1)} priority, ${urgency}, ~${fmtHours(it.hours)} of effort.`;
     };
 
-    // Schedule packing: fit tasks into the hours budget per day or week
+    // Capacity-aware schedule packing.
     const totalCapacity = range === "daily" ? hours : hours * 5;
-    let remaining = totalCapacity;
     const slotLabels =
       range === "daily"
         ? ["9:00 – 10:30", "10:45 – 12:00", "13:00 – 14:30", "14:45 – 16:00", "16:15 – 17:30"]
         : ["Mon AM", "Mon PM", "Tue AM", "Tue PM", "Wed AM", "Wed PM", "Thu AM", "Thu PM", "Fri AM"];
+    const slotHours = range === "daily" ? 1.5 : 3;
 
-    const schedule: { slot: string; task: string }[] = [];
+    let remaining = totalCapacity;
+    const schedule: ScheduleBlock[] = [];
+    const fits: string[] = [];
+    const movedLater: string[] = [];
     let slotIdx = 0;
-    for (const it of items) {
-      if (slotIdx >= slotLabels.length) break;
-      if (remaining <= 0) break;
-      const fitted = Math.min(it.hours, remaining);
-      schedule.push({
-        slot: slotLabels[slotIdx++],
-        task: `${it.task} (${fitted}h${fitted < it.hours ? " — partial; continue next session" : ""})`,
-      });
-      remaining -= fitted;
+
+    // Only items eligible for today's schedule get blocks.
+    const schedulable = items.filter((i) => {
+      const b = bucketFor(i);
+      return b === "Do first" || b === "Schedule today";
+    });
+    const overflowEligible = items.filter((i) => !schedulable.includes(i));
+
+    for (const it of schedulable) {
+      if (remaining <= 0 || slotIdx >= slotLabels.length) {
+        movedLater.push(it.task);
+        continue;
+      }
+      let needed = it.hours;
+      let sessionNum = 0;
+      const sessions: number[] = [];
+      while (needed > 0 && remaining > 0 && slotIdx < slotLabels.length) {
+        const block = Math.min(needed, slotHours, remaining);
+        sessions.push(block);
+        schedule.push({
+          slot: slotLabels[slotIdx++],
+          task:
+            sessions.length > 1 || needed - block > 0
+              ? `${it.task} — session ${++sessionNum} of ${Math.ceil(it.hours / slotHours)} (${fmtHours(block)})`
+              : `${it.task} (${fmtHours(block)})`,
+          hours: block,
+        });
+        needed -= block;
+        remaining -= block;
+      }
+      if (needed > 0) {
+        movedLater.push(`${it.task} — ${fmtHours(needed)} remaining`);
+      } else {
+        fits.push(it.task);
+      }
     }
+    for (const it of overflowEligible) movedLater.push(it.task);
 
-    const totalEffort = items.reduce((s, it) => s + it.hours, 0);
-    const overload = totalEffort > totalCapacity;
+    const totalRequired = items.reduce((s, it) => s + it.hours, 0);
+    const used = totalCapacity - remaining;
+    const overload = totalRequired > totalCapacity;
 
+    // Risks
     const risks: string[] = [];
     if (overload) {
       risks.push(
-        `Total effort (${totalEffort}h) exceeds available capacity (${totalCapacity}h) — consider deferring or delegating lower-priority items.`,
+        `Total required effort is ${fmtHours(totalRequired)} but only ${fmtHours(totalCapacity)} are available — ${movedLater.length} item(s) need to move.`,
       );
     }
-    const today = items.filter((i) => i.daysToDue === 0);
-    if (today.length > 1) risks.push(`${today.length} tasks are due today — risk of context-switching loss.`);
-    const noDue = items.filter((i) => i.due === NOT_SPECIFIED);
+    const dueToday = items.filter((i) => i.daysToDue === 0);
+    if (dueToday.length > 1) risks.push(`${dueToday.length} tasks are due today — risk of context-switching loss.`);
+    const noDue = items.filter((i) => !Number.isFinite(i.daysToDue));
     if (noDue.length) risks.push(`${noDue.length} task(s) have no deadline — clarify before they slip.`);
-    if (!risks.length) risks.push("No major risks detected with the current load.");
+    const overdueLike = items.filter((i) => i.daysToDue < 0);
+    if (overdueLike.length) risks.push(`${overdueLike.length} task(s) appear to be past their deadline.`);
+    if (!risks.length) risks.push("Current load fits within available capacity.");
 
+    // Tips
     const tips: string[] = [];
-    const topTwo = items.slice(0, 2).map((i) => i.task).join(" and ");
-    if (topTwo) tips.push(`Protect your first deep-focus block for ${topTwo}.`);
-    const shallow = items.filter((i) => /email|review|update|reply|admin/i.test(i.task));
-    if (shallow.length) {
+    const top = items[0];
+    if (top) tips.push(`Protect your first focus block for "${top.task}" — it scores highest on urgency and priority.`);
+    const shallow = items.filter((i) => /email|review|update|reply|admin|chase|ping/i.test(i.task));
+    if (shallow.length >= 2) {
       tips.push(`Batch shallow work (${shallow.map((s) => s.task).join(", ")}) into one afternoon block.`);
     }
-    tips.push(
-      `You have ${hours}h per day available — aim to keep 1h unbooked for unplanned requests and recovery.`,
-    );
+    tips.push(`Keep ~${Math.max(0.5, hours - used).toFixed(1)}h unbooked for unplanned requests and recovery.`);
 
-    const p: Plan = {
-      prioritized: items.map((it) => ({
-        task: it.task,
-        bucket: bucketFor(it),
-        reason: reasonFor(it),
-        due: it.due,
-        hours: it.hours,
-      })),
+    const nextSteps: string[] = [];
+    if (schedule.length) nextSteps.push(`Block the ${schedule.length} suggested slot(s) on your calendar now.`);
+    if (top) nextSteps.push(`Start with "${top.task}" while energy is highest.`);
+    if (movedLater.length) {
+      nextSteps.push(`Reschedule or delegate: ${movedLater.join("; ")}.`);
+    } else {
+      nextSteps.push(`Re-run this planner at end-of-${range === "daily" ? "day" : "week"} to rebalance.`);
+    }
+
+    const prioritized: PrioritizedItem[] = items.map((it) => ({
+      task: it.task,
+      bucket: bucketFor(it),
+      reason: reasonFor(it),
+      due: it.dueRaw ? titleCaseDue(it.dueRaw) : NOT_SPECIFIED,
+      hours: it.hours,
+    }));
+
+    setPlan({
+      prioritized,
       schedule,
+      capacity: { total: totalCapacity, used, required: totalRequired, fits, movedLater },
       tips,
       risks,
-      nextSteps: [
-        `Block the ${schedule.length} suggested slot${schedule.length === 1 ? "" : "s"} on your calendar now.`,
-        items[0] ? `Start with "${items[0].task}" while energy is highest.` : "Pick a starting task.",
-        overload
-          ? `Negotiate scope on ${items[items.length - 1].task} — it's the lowest-leverage item this ${range === "daily" ? "day" : "week"}.`
-          : `Re-run this planner at end-of-${range === "daily" ? "day" : "week"} to rebalance.`,
-      ],
-    };
-    setPlan(p);
+      nextSteps,
+    });
     addOutput({
       type: "Task Plan",
       title: `${range === "daily" ? "Daily" : "Weekly"} plan — ${new Date().toISOString().slice(0, 10)}`,
@@ -193,8 +268,15 @@ function PlannerPage() {
   const copyPlan = () => {
     if (!plan) return;
     const text = [
+      "Capacity:",
+      ` - Available: ${fmtHours(plan.capacity.total)}`,
+      ` - Required: ${fmtHours(plan.capacity.required)}`,
+      ` - Scheduled: ${fmtHours(plan.capacity.used)}`,
+      ...(plan.capacity.fits.length ? [" - Fits today:", ...plan.capacity.fits.map((f) => `    • ${f}`)] : []),
+      ...(plan.capacity.movedLater.length ? [" - Moved later:", ...plan.capacity.movedLater.map((f) => `    • ${f}`)] : []),
+      "",
       "Prioritized:",
-      ...plan.prioritized.map((p) => ` - [${p.bucket}] ${p.task} — ${p.reason}`),
+      ...plan.prioritized.map((p) => ` - [${p.bucket}] ${p.task} — ${p.reason} (Due: ${p.due})`),
       "",
       "Schedule:",
       ...plan.schedule.map((s) => ` - ${s.slot}: ${s.task}`),
@@ -212,6 +294,14 @@ function PlannerPage() {
     ].join("\n");
     navigator.clipboard.writeText(text);
     toast.success("Copied");
+  };
+
+  const bucketColor: Record<Bucket, string> = {
+    "Do first": "border-red-200 bg-red-50 text-red-700",
+    "Schedule today": "border-accent/30 bg-accent/10 text-accent",
+    "Schedule later": "border-blue-200 bg-blue-50 text-blue-700",
+    Delegate: "border-amber-200 bg-amber-50 text-amber-800",
+    Defer: "border-slate-200 bg-slate-50 text-slate-600",
   };
 
   return (
@@ -284,29 +374,55 @@ function PlannerPage() {
             ) : (
               <div className="space-y-5 text-sm">
                 <div>
+                  <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Capacity check</h3>
+                  <div className="rounded-lg border bg-background/60 p-3 space-y-2">
+                    <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs">
+                      <span><span className="text-muted-foreground">Available:</span> <strong>{fmtHours(plan.capacity.total)}</strong></span>
+                      <span><span className="text-muted-foreground">Required:</span> <strong>{fmtHours(plan.capacity.required)}</strong></span>
+                      <span><span className="text-muted-foreground">Scheduled:</span> <strong>{fmtHours(plan.capacity.used)}</strong></span>
+                    </div>
+                    {plan.capacity.fits.length > 0 && (
+                      <div>
+                        <p className="text-xs font-medium text-emerald-700">Fits today</p>
+                        <ul className="list-disc pl-5 text-xs">{plan.capacity.fits.map((f, i) => <li key={i}>{f}</li>)}</ul>
+                      </div>
+                    )}
+                    {plan.capacity.movedLater.length > 0 && (
+                      <div>
+                        <p className="text-xs font-medium text-amber-700">Move later</p>
+                        <ul className="list-disc pl-5 text-xs">{plan.capacity.movedLater.map((f, i) => <li key={i}>{f}</li>)}</ul>
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div>
                   <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Prioritized list</h3>
                   <div className="space-y-2">
                     {plan.prioritized.map((p, i) => (
                       <div key={i} className="rounded-lg border bg-background/60 p-3">
                         <div className="flex items-center justify-between gap-2">
                           <p className="font-medium">{p.task}</p>
-                          <Badge variant="outline" className="border-accent/30 bg-accent/10 text-accent">{p.bucket}</Badge>
+                          <Badge variant="outline" className={bucketColor[p.bucket]}>{p.bucket}</Badge>
                         </div>
-                        <p className="mt-1 text-xs text-muted-foreground">{p.reason}</p>
+                        <p className="mt-1 text-xs text-muted-foreground">{p.reason} · Due: {p.due}</p>
                       </div>
                     ))}
                   </div>
                 </div>
                 <div>
                   <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Recommended schedule</h3>
-                  <div className="divide-y rounded-lg border">
-                    {plan.schedule.map((s, i) => (
-                      <div key={i} className="flex items-center justify-between gap-3 px-3 py-2">
-                        <span className="text-xs font-medium text-muted-foreground">{s.slot}</span>
-                        <span className="text-right">{s.task}</span>
-                      </div>
-                    ))}
-                  </div>
+                  {plan.schedule.length ? (
+                    <div className="divide-y rounded-lg border">
+                      {plan.schedule.map((s, i) => (
+                        <div key={i} className="flex items-center justify-between gap-3 px-3 py-2">
+                          <span className="text-xs font-medium text-muted-foreground">{s.slot}</span>
+                          <span className="text-right">{s.task}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">No tasks scheduled for today — all items are scheduled later or deferred.</p>
+                  )}
                 </div>
                 <div>
                   <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Risks &amp; blockers</h3>
