@@ -7,8 +7,9 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useStore } from "@/lib/store";
-import { Sparkles, Copy, BarChart3 } from "lucide-react";
+import { Sparkles, Copy, BarChart3, Info } from "lucide-react";
 import { toast } from "sonner";
+import { DISCLAIMER, NOT_SPECIFIED, splitSentences, classifySentences } from "@/lib/ai-helpers";
 
 export const Route = createFileRoute("/reports")({
   head: () => ({
@@ -29,6 +30,9 @@ interface Report {
   nextSteps: string[];
 }
 
+const COMPLETED_RE = /\b(done|completed|finished|shipped|launched|delivered|signed off|approved|merged|deployed)\b/i;
+const PENDING_RE = /\b(in progress|wip|started|drafting|building|reviewing|pending|to do|todo|planned|scheduled|upcoming)\b/i;
+
 function ReportsPage() {
   const { projects, tasks, addOutput } = useStore();
   const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
@@ -40,30 +44,76 @@ function ReportsPage() {
   const generate = () => {
     const project = projects.find((p) => p.id === projectId);
     if (!project) return toast.error("Select a project");
+    if (!notes.trim()) return toast.error("Add progress notes");
+
+    const sentences = splitSentences(notes);
+    const { decisions, actions, risks: noteRisks } = classifySentences(sentences);
+
+    const completedFromNotes = sentences.filter((s) => COMPLETED_RE.test(s));
+    const pendingFromNotes = sentences.filter(
+      (s) => PENDING_RE.test(s) && !COMPLETED_RE.test(s),
+    );
+
     const projTasks = tasks.filter((t) => t.projectId === projectId);
-    const completed = projTasks.filter((t) => t.status === "Completed").map((t) => t.title);
-    const pending = projTasks.filter((t) => t.status !== "Completed").map((t) => t.title);
+    const completedTasks = projTasks.filter((t) => t.status === "Completed").map((t) => t.title);
+    const pendingTasks = projTasks.filter((t) => t.status !== "Completed").map((t) => `${t.title} (${t.status}, owner: ${t.assignee})`);
+
+    const completed = [...completedFromNotes, ...completedTasks];
+    const pending = [...pendingFromNotes, ...pendingTasks, ...actions];
+
+    const dueInDays = Math.round((new Date(project.dueDate).getTime() - Date.now()) / 86400000);
+    const dueDescriptor =
+      dueInDays < 0
+        ? `${Math.abs(dueInDays)} days overdue`
+        : dueInDays === 0
+          ? "due today"
+          : `${dueInDays} days remaining`;
+
+    const completionRate = projTasks.length
+      ? Math.round((completedTasks.length / projTasks.length) * 100)
+      : 0;
+
+    const summary =
+      `${project.name} (client: ${project.client || NOT_SPECIFIED}) is currently ${project.status} ` +
+      `with ${project.priority.toLowerCase()} priority. Target milestone: ${project.dueDate} (${dueDescriptor}). ` +
+      `${projTasks.length ? `Of ${projTasks.length} tracked tasks, ${completedTasks.length} (${completionRate}%) are complete.` : "No tasks are currently tracked for this project."} ` +
+      `Latest notes captured ${completedFromNotes.length} completed item${completedFromNotes.length === 1 ? "" : "s"}, ` +
+      `${pendingFromNotes.length + actions.length} in-flight item${pendingFromNotes.length + actions.length === 1 ? "" : "s"}, and ` +
+      `${noteRisks.length} risk signal${noteRisks.length === 1 ? "" : "s"}.`;
+
+    const risks: string[] = [];
+    if (noteRisks.length) risks.push(...noteRisks);
+    if (dueInDays < 0) risks.push(`Project is past its due date (${project.dueDate}).`);
+    else if (dueInDays <= 7 && completionRate < 80) {
+      risks.push(`Only ${dueInDays} day(s) until ${project.dueDate} with completion at ${completionRate}% — timeline at risk.`);
+    }
+    const critical = projTasks.filter((t) => t.priority === "Critical" && t.status !== "Completed");
+    if (critical.length) {
+      risks.push(`${critical.length} critical task(s) still open: ${critical.map((t) => t.title).join(", ")}.`);
+    }
+    if (!risks.length) risks.push("No critical risks identified from notes or task data.");
+
+    const recommendations: string[] = [];
+    if (pending.length === 0) recommendations.push("Confirm scope is fully captured — no in-flight work is recorded.");
+    if (critical.length) recommendations.push(`Re-confirm owners and ETAs for the ${critical.length} critical task(s) above.`);
+    if (noteRisks.length) recommendations.push(`Resolve or escalate the ${noteRisks.length} flagged risk(s) before the next stakeholder review.`);
+    if (decisions.length) recommendations.push(`Document the ${decisions.length} decision(s) made this period in the project log.`);
+    if (recommendations.length < 2) {
+      recommendations.push("Maintain weekly cadence and refresh this report after each working session.");
+    }
+
+    const nextSteps: string[] = [];
+    if (pending[0]) nextSteps.push(`Prioritize: ${pending[0]}.`);
+    nextSteps.push(`Drive ${project.name} toward the ${project.dueDate} milestone with focus on the open critical items.`);
+    nextSteps.push(`Share this report with ${project.client || "stakeholders"} ahead of the next checkpoint.`);
 
     const r: Report = {
-      summary: `${project.name} for ${project.client} is currently ${project.status.toLowerCase()} with a ${project.priority.toLowerCase()} priority. Based on the latest notes, the team has made measurable progress toward the ${project.dueDate} milestone, with a small number of focused risks to address this week.`,
-      completed: completed.length ? completed : ["Initial scoping and kickoff complete."],
-      pending: pending.length ? pending : ["No outstanding tracked tasks — confirm scope is captured."],
-      risks: [
-        notes.includes("Awaiting") || notes.includes("blocker")
-          ? "External dependency identified in notes — may delay downstream work."
-          : "No critical blockers reported, but watch capacity into next sprint.",
-        "Stakeholder availability for upcoming review.",
-      ],
-      recommendations: [
-        "Confirm owners and deadlines for each pending item.",
-        "Schedule a 30-minute mid-week sync to unblock the items above.",
-        "Communicate status to stakeholders proactively before the next review.",
-      ],
-      nextSteps: [
-        `Push pending work toward the ${project.dueDate} milestone.`,
-        "Refresh this report at the end of the week with new progress notes.",
-        "Escalate any unresolved risks in the next steering check-in.",
-      ],
+      summary,
+      completed: completed.length ? completed : [`${NOT_SPECIFIED} — no completed work captured yet.`],
+      pending: pending.length ? pending : [`${NOT_SPECIFIED} — no pending items captured.`],
+      risks,
+      recommendations,
+      nextSteps,
     };
     setReport(r);
     addOutput({ type: "Report", title: `${project.name} — status report` });
@@ -89,6 +139,8 @@ function ReportsPage() {
       "",
       "Next steps:",
       ...report.nextSteps.map((c) => ` - ${c}`),
+      "",
+      DISCLAIMER,
     ].join("\n");
     navigator.clipboard.writeText(text);
     toast.success("Copied");
@@ -151,6 +203,10 @@ function ReportsPage() {
                 <Section title="Risks & blockers"><Ul items={report.risks} /></Section>
                 <Section title="Recommendations"><Ul items={report.recommendations} /></Section>
                 <Section title="Next steps"><Ul items={report.nextSteps} /></Section>
+                <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+                  <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>{DISCLAIMER}</span>
+                </div>
               </div>
             )}
           </CardContent>

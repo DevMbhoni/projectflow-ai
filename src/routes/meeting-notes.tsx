@@ -8,8 +8,20 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useStore } from "@/lib/store";
-import { Sparkles, Copy, FileText } from "lucide-react";
+import { Sparkles, Copy, FileText, Info } from "lucide-react";
 import { toast } from "sonner";
+import {
+  DISCLAIMER,
+  NOT_SPECIFIED,
+  splitSentences,
+  classifySentences,
+  keywords,
+  extractDeadline,
+  extractOwner,
+  toImperative,
+  inDays,
+  properNouns,
+} from "@/lib/ai-helpers";
 
 export const Route = createFileRoute("/meeting-notes")({
   head: () => ({
@@ -26,6 +38,7 @@ interface Summary {
   keyPoints: string[];
   decisions: string[];
   actionItems: { task: string; owner: string; deadline: string }[];
+  followUps: string[];
 }
 
 function MeetingNotesPage() {
@@ -41,28 +54,69 @@ function MeetingNotesPage() {
 
   const generate = () => {
     if (!notes.trim()) return toast.error("Paste your notes first");
-    const lines = notes.split(/[\.\n]+/).map((l) => l.trim()).filter(Boolean);
-    const attendeeList = attendees.split(",").map((s) => s.trim()).filter(Boolean);
-    const owner = (i: number) => attendeeList[i % Math.max(attendeeList.length, 1)] ?? "Unassigned";
-    const fmtDate = (d: number) =>
-      new Date(Date.now() + d * 86400000).toISOString().slice(0, 10);
 
-    const summary: Summary = {
-      summary: `On ${date}, the team met to review "${title}". The conversation focused on ${lines[0]?.toLowerCase() ?? "key project updates"}, alignment on next steps, and open risks to address before the next checkpoint.`,
-      keyPoints: lines.slice(0, 5).map((l) => l.replace(/^[-•]\s*/, "")),
-      decisions: [
-        "Move forward with the proposed direction discussed.",
-        "Escalate blockers to leadership in the next steering review.",
-        "Reconvene next week to confirm progress against owners.",
-      ],
-      actionItems: lines.slice(0, 4).map((l, i) => ({
-        task: l.replace(/^[-•]\s*/, "").slice(0, 120),
-        owner: owner(i),
-        deadline: fmtDate(3 + i * 2),
-      })),
+    const attendeeList = attendees.split(",").map((s) => s.trim()).filter(Boolean);
+    const sentences = splitSentences(notes);
+    const { decisions, actions, risks, points } = classifySentences(sentences);
+    const kw = keywords(notes, 6);
+    const mentioned = properNouns(notes).filter(
+      (n) => !attendeeList.some((a) => a.toLowerCase().includes(n.toLowerCase())),
+    );
+    const project = projects.find((p) => p.id === projectId);
+
+    const topic =
+      kw.length > 0
+        ? kw.slice(0, 3).join(", ")
+        : sentences[0]?.slice(0, 60).toLowerCase() ?? "the agenda";
+
+    const summary =
+      `On ${date || NOT_SPECIFIED}, ${attendeeList.length ? attendeeList.join(", ") : "the team"} met` +
+      `${title ? ` for "${title}"` : ""}${project ? ` (project: ${project.name})` : ""}. ` +
+      `Discussion focused on ${topic}. ` +
+      `${decisions.length} decision${decisions.length === 1 ? "" : "s"} were recorded, ` +
+      `${actions.length} action item${actions.length === 1 ? "" : "s"} captured, and ` +
+      `${risks.length} risk${risks.length === 1 ? "" : "s"} flagged for follow-up.`;
+
+    const keyPoints =
+      points.length > 0
+        ? points.slice(0, 6)
+        : sentences.slice(0, 4);
+
+    const actionItems = (actions.length ? actions : sentences.slice(0, 3)).slice(0, 6).map((s, i) => {
+      const owner =
+        extractOwner(s, attendeeList) ??
+        (mentioned[0] ? mentioned[0] : attendeeList[i % Math.max(attendeeList.length, 1)] ?? NOT_SPECIFIED);
+      const dl = extractDeadline(s) ?? inDays(3 + i * 2);
+      return { task: toImperative(s).slice(0, 160), owner, deadline: dl };
+    });
+
+    const followUps: string[] = [];
+    if (risks.length) {
+      followUps.push(
+        `Address the flagged ${risks.length === 1 ? "risk" : "risks"}: ${risks
+          .map((r) => r.slice(0, 90))
+          .join("; ")}.`,
+      );
+    }
+    if (mentioned.length) {
+      followUps.push(`Loop in ${mentioned.slice(0, 3).join(", ")} on the relevant action items.`);
+    }
+    if (decisions.length === 0) {
+      followUps.push("No clear decisions were captured — confirm intent with the group before the next sync.");
+    }
+    followUps.push(`Circulate this summary to ${attendeeList.length ? attendeeList.join(", ") : "attendees"} within 24 hours.`);
+
+    const summaryObj: Summary = {
+      summary,
+      keyPoints,
+      decisions: decisions.length ? decisions : [`${NOT_SPECIFIED} — no explicit decisions detected in the notes.`],
+      actionItems: actionItems.length
+        ? actionItems
+        : [{ task: NOT_SPECIFIED, owner: NOT_SPECIFIED, deadline: NOT_SPECIFIED }],
+      followUps,
     };
-    setOut(summary);
-    addOutput({ type: "Meeting Summary", title: `${title} — ${date}` });
+    setOut(summaryObj);
+    addOutput({ type: "Meeting Summary", title: `${title || "Meeting"} — ${date}` });
     toast.success("Summary generated");
   };
 
@@ -71,7 +125,7 @@ function MeetingNotesPage() {
     const text = [
       `Summary: ${out.summary}`,
       "",
-      "Key points:",
+      "Key discussion points:",
       ...out.keyPoints.map((p) => ` - ${p}`),
       "",
       "Decisions:",
@@ -79,6 +133,11 @@ function MeetingNotesPage() {
       "",
       "Action items:",
       ...out.actionItems.map((a) => ` - ${a.task} (Owner: ${a.owner}, Due: ${a.deadline})`),
+      "",
+      "Follow-up recommendations:",
+      ...out.followUps.map((f) => ` - ${f}`),
+      "",
+      DISCLAIMER,
     ].join("\n");
     navigator.clipboard.writeText(text);
     toast.success("Copied to clipboard");
@@ -173,6 +232,12 @@ function MeetingNotesPage() {
                     ))}
                   </div>
                 </Section>
+                <Section title="Follow-up recommendations">
+                  <ul className="list-disc space-y-1 pl-5">
+                    {out.followUps.map((k, i) => <li key={i}>{k}</li>)}
+                  </ul>
+                </Section>
+                <Disclaimer />
               </div>
             )}
           </CardContent>
@@ -187,6 +252,15 @@ function Section({ title, children }: { title: string; children: React.ReactNode
     <div>
       <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</h3>
       {children}
+    </div>
+  );
+}
+
+function Disclaimer() {
+  return (
+    <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+      <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+      <span>{DISCLAIMER}</span>
     </div>
   );
 }
