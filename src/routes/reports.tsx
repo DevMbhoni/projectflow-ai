@@ -9,7 +9,16 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { useStore } from "@/lib/store";
 import { Sparkles, Copy, BarChart3, Info } from "lucide-react";
 import { toast } from "sonner";
-import { DISCLAIMER, NOT_SPECIFIED, splitSentences, classifySentences } from "@/lib/ai-helpers";
+import {
+  DISCLAIMER,
+  NOT_SPECIFIED,
+  splitSentences,
+  classifySentences,
+  extractDeadline,
+  extractOwner,
+  dedupe,
+  sentenceTopic,
+} from "@/lib/ai-helpers";
 
 export const Route = createFileRoute("/reports")({
   head: () => ({
@@ -22,113 +31,219 @@ export const Route = createFileRoute("/reports")({
 });
 
 interface Report {
-  summary: string;
+  executiveSummary: string;
   completed: string[];
+  inProgress: string[];
   pending: string[];
   risks: string[];
   recommendations: string[];
   nextSteps: string[];
 }
 
-const COMPLETED_RE = /\b(done|completed|finished|shipped|launched|delivered|signed off|approved|merged|deployed)\b/i;
-const PENDING_RE = /\b(in progress|wip|started|drafting|building|reviewing|pending|to do|todo|planned|scheduled|upcoming)\b/i;
+const COMPLETED_RE = /\b(done|completed|finished|shipped|launched|delivered|signed off|approved|merged|deployed|wrapped|closed)\b/i;
+const IN_PROGRESS_RE = /\b(in progress|wip|started|drafting|building|reviewing|working on|underway|ongoing)\b/i;
+const PENDING_RE = /\b(pending|to do|todo|planned|scheduled|upcoming|not started|next up|awaiting|waiting)\b/i;
+const REVIEW_DATE_RE = /\b(review|checkpoint|sync|demo|presentation|meeting)\b/i;
 
 function ReportsPage() {
   const { projects, tasks, addOutput } = useStore();
   const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
   const [notes, setNotes] = useState(
-    "Design system tokens complete. Auth screens started. Awaiting API spec for loyalty endpoints. Stakeholder review scheduled next Tuesday.",
+    "Design system tokens complete. Auth screens in progress, owned by Diego. Booking page timeline is at risk because the loyalty API specification is still pending from the backend team. Stakeholder review scheduled for next Tuesday.",
   );
+  const [useProjectData, setUseProjectData] = useState(true);
   const [report, setReport] = useState<Report | null>(null);
 
   const generate = () => {
     const project = projects.find((p) => p.id === projectId);
-    if (!project) return toast.error("Select a project");
     if (!notes.trim()) return toast.error("Add progress notes");
 
     const sentences = splitSentences(notes);
-    const { decisions, actions, risks: noteRisks } = classifySentences(sentences);
+    const { decisions, actions, risks: noteRisks, points } = classifySentences(sentences);
 
-    const completedFromNotes = sentences.filter((s) => COMPLETED_RE.test(s));
-    const pendingFromNotes = sentences.filter(
-      (s) => PENDING_RE.test(s) && !COMPLETED_RE.test(s),
+    // Bucket sentences by explicit status words first; otherwise treat "actions" as in-progress.
+    const completedFromNotes = dedupe(sentences.filter((s) => COMPLETED_RE.test(s)));
+    const inProgressFromNotes = dedupe(
+      sentences.filter((s) => IN_PROGRESS_RE.test(s) && !COMPLETED_RE.test(s)),
+    );
+    const pendingFromNotes = dedupe(
+      sentences.filter((s) => PENDING_RE.test(s) && !COMPLETED_RE.test(s) && !IN_PROGRESS_RE.test(s)),
     );
 
-    const projTasks = tasks.filter((t) => t.projectId === projectId);
-    const completedTasks = projTasks.filter((t) => t.status === "Completed").map((t) => t.title);
-    const pendingTasks = projTasks.filter((t) => t.status !== "Completed").map((t) => `${t.title} (${t.status}, owner: ${t.assignee})`);
+    // Action-shaped sentences that don't already fall into a bucket become "in progress" if they
+    // describe ongoing work, or "pending" if they're future-tense.
+    const leftoverActions = actions.filter(
+      (s) =>
+        !completedFromNotes.includes(s) &&
+        !inProgressFromNotes.includes(s) &&
+        !pendingFromNotes.includes(s),
+    );
+    for (const s of leftoverActions) {
+      if (/\bwill\b|\bgoing to\b|\bplan to\b/i.test(s)) pendingFromNotes.push(s);
+      else inProgressFromNotes.push(s);
+    }
 
-    const completed = [...completedFromNotes, ...completedTasks];
-    const pending = [...pendingFromNotes, ...pendingTasks, ...actions];
+    // Optionally enrich from real project task data — never invent counts when toggled off.
+    const projTasks = useProjectData && project ? tasks.filter((t) => t.projectId === project.id) : [];
+    const completedTasks = projTasks.filter((t) => t.status === "Completed");
+    const inProgressTasks = projTasks.filter((t) => t.status === "In Progress" || t.status === "Review");
+    const pendingTasks = projTasks.filter((t) => t.status === "To Do");
 
-    const dueInDays = Math.round((new Date(project.dueDate).getTime() - Date.now()) / 86400000);
-    const dueDescriptor =
-      dueInDays < 0
-        ? `${Math.abs(dueInDays)} days overdue`
-        : dueInDays === 0
-          ? "due today"
-          : `${dueInDays} days remaining`;
+    const fmtTask = (t: (typeof projTasks)[number]) =>
+      `${t.title} (owner: ${t.assignee}, due ${t.dueDate})`;
 
-    const completionRate = projTasks.length
-      ? Math.round((completedTasks.length / projTasks.length) * 100)
-      : 0;
+    const completed = dedupe([
+      ...completedFromNotes,
+      ...completedTasks.map(fmtTask),
+    ]);
+    const inProgress = dedupe([
+      ...inProgressFromNotes,
+      ...inProgressTasks.map(fmtTask),
+    ]);
+    const pending = dedupe([
+      ...pendingFromNotes,
+      ...pendingTasks.map(fmtTask),
+    ]);
 
-    const summary =
-      `${project.name} (client: ${project.client || NOT_SPECIFIED}) is currently ${project.status} ` +
-      `with ${project.priority.toLowerCase()} priority. Target milestone: ${project.dueDate} (${dueDescriptor}). ` +
-      `${projTasks.length ? `Of ${projTasks.length} tracked tasks, ${completedTasks.length} (${completionRate}%) are complete.` : "No tasks are currently tracked for this project."} ` +
-      `Latest notes captured ${completedFromNotes.length} completed item${completedFromNotes.length === 1 ? "" : "s"}, ` +
-      `${pendingFromNotes.length + actions.length} in-flight item${pendingFromNotes.length + actions.length === 1 ? "" : "s"}, and ` +
-      `${noteRisks.length} risk signal${noteRisks.length === 1 ? "" : "s"}.`;
+    // Executive summary — only mention facts we actually have.
+    const parts: string[] = [];
+    if (project) {
+      const clientPart = project.client && project.client !== "Internal" ? ` for ${project.client}` : "";
+      parts.push(
+        `${project.name}${clientPart} is currently ${project.status.toLowerCase()} with ${project.priority.toLowerCase()} priority.`,
+      );
+      if (project.dueDate) parts.push(`Target milestone: ${project.dueDate}.`);
+    }
+    if (projTasks.length) {
+      const pct = Math.round((completedTasks.length / projTasks.length) * 100);
+      parts.push(
+        `${completedTasks.length} of ${projTasks.length} tracked task${projTasks.length === 1 ? "" : "s"} are complete (${pct}%).`,
+      );
+    }
+    const noteCounts: string[] = [];
+    if (completedFromNotes.length) noteCounts.push(`${completedFromNotes.length} completed`);
+    if (inProgressFromNotes.length + leftoverActions.filter((s) => !/\bwill\b|\bgoing to\b|\bplan to\b/i.test(s)).length)
+      noteCounts.push(`${inProgressFromNotes.length} in progress`);
+    if (pendingFromNotes.length) noteCounts.push(`${pendingFromNotes.length} pending`);
+    if (noteRisks.length) noteCounts.push(`${noteRisks.length} risk${noteRisks.length === 1 ? "" : "s"}`);
+    if (noteCounts.length) parts.push(`Latest notes capture ${noteCounts.join(", ")}.`);
+    const executiveSummary = parts.join(" ") || "Status snapshot based on the notes below.";
 
-    const risks: string[] = [];
-    if (noteRisks.length) risks.push(...noteRisks);
-    if (dueInDays < 0) risks.push(`Project is past its due date (${project.dueDate}).`);
-    else if (dueInDays <= 7 && completionRate < 80) {
-      risks.push(`Only ${dueInDays} day(s) until ${project.dueDate} with completion at ${completionRate}% — timeline at risk.`);
+    // Risks — explain impact when possible.
+    const risksOut: string[] = [];
+    for (const r of dedupe(noteRisks)) {
+      const topic = sentenceTopic(r);
+      let impact = "";
+      if (/pending|missing|awaiting|blocked/i.test(r)) {
+        impact = " This is likely to delay dependent work until it's resolved.";
+      } else if (/delay|delayed|slip|behind/i.test(r)) {
+        impact = " Timeline impact should be quantified and communicated to stakeholders.";
+      } else if (/bug|outage|issue/i.test(r)) {
+        impact = " User-facing impact should be assessed before the next release.";
+      }
+      risksOut.push(`${topic.charAt(0).toUpperCase() + topic.slice(1)}.${impact}`);
+    }
+    if (project && project.dueDate) {
+      const dueInDays = Math.round((new Date(project.dueDate).getTime() - Date.now()) / 86400000);
+      if (dueInDays < 0) {
+        risksOut.push(`Project is ${Math.abs(dueInDays)} day(s) past the ${project.dueDate} milestone.`);
+      } else if (projTasks.length && dueInDays <= 7) {
+        const pct = Math.round((completedTasks.length / projTasks.length) * 100);
+        if (pct < 80) {
+          risksOut.push(
+            `Only ${dueInDays} day(s) remain until ${project.dueDate} with completion at ${pct}% — timeline at risk.`,
+          );
+        }
+      }
     }
     const critical = projTasks.filter((t) => t.priority === "Critical" && t.status !== "Completed");
     if (critical.length) {
-      risks.push(`${critical.length} critical task(s) still open: ${critical.map((t) => t.title).join(", ")}.`);
+      risksOut.push(
+        `${critical.length} critical task(s) still open: ${critical.map((t) => t.title).join(", ")}.`,
+      );
     }
-    if (!risks.length) risks.push("No critical risks identified from notes or task data.");
+    if (!risksOut.length) risksOut.push("No risks or blockers identified.");
 
+    // Recommendations — practical, derived from what's actually in the notes/data.
     const recommendations: string[] = [];
-    if (pending.length === 0) recommendations.push("Confirm scope is fully captured — no in-flight work is recorded.");
-    if (critical.length) recommendations.push(`Re-confirm owners and ETAs for the ${critical.length} critical task(s) above.`);
-    if (noteRisks.length) recommendations.push(`Resolve or escalate the ${noteRisks.length} flagged risk(s) before the next stakeholder review.`);
-    if (decisions.length) recommendations.push(`Document the ${decisions.length} decision(s) made this period in the project log.`);
-    if (recommendations.length < 2) {
+    for (const r of dedupe(noteRisks).slice(0, 3)) {
+      const topic = sentenceTopic(r).replace(/\.$/, "");
+      if (/pending|missing|awaiting|blocked/i.test(r)) {
+        recommendations.push(`Escalate to unblock: ${topic}.`);
+      } else if (/delay|slip|behind/i.test(r)) {
+        recommendations.push(`Re-plan affected scope and communicate the new ETA: ${topic}.`);
+      } else {
+        recommendations.push(`Address before the next checkpoint: ${topic}.`);
+      }
+    }
+    const unowned = inProgress.concat(pending).filter((s) => !/owner:/i.test(s) && !extractOwner(s, []));
+    if (unowned.length >= 2) {
+      recommendations.push("Assign clear owners to in-flight and pending items that don't have one yet.");
+    }
+    if (critical.length) {
+      recommendations.push(`Re-confirm owners and ETAs for the ${critical.length} open critical task(s).`);
+    }
+    if (decisions.length) {
+      recommendations.push(`Log the ${decisions.length} decision(s) made this period in the project record.`);
+    }
+    if (!recommendations.length) {
       recommendations.push("Maintain weekly cadence and refresh this report after each working session.");
     }
 
+    // Next steps — include any explicit review/checkpoint date from the notes.
     const nextSteps: string[] = [];
-    if (pending[0]) nextSteps.push(`Prioritize: ${pending[0]}.`);
-    nextSteps.push(`Drive ${project.name} toward the ${project.dueDate} milestone with focus on the open critical items.`);
-    nextSteps.push(`Share this report with ${project.client || "stakeholders"} ahead of the next checkpoint.`);
+    const reviewSentence = sentences.find((s) => REVIEW_DATE_RE.test(s) && extractDeadline(s));
+    if (reviewSentence) {
+      const dl = extractDeadline(reviewSentence);
+      nextSteps.push(`Prepare for the ${reviewSentence.replace(/\.$/, "")} (${dl}).`);
+    }
+    const topPending = pending[0] || inProgress[0];
+    if (topPending) nextSteps.push(`Drive forward: ${sentenceTopic(topPending).replace(/\.$/, "")}.`);
+    if (project) {
+      nextSteps.push(
+        `Share this report with ${project.client && project.client !== "Internal" ? project.client : "stakeholders"} ahead of the next checkpoint.`,
+      );
+    } else {
+      nextSteps.push("Share this report with stakeholders ahead of the next checkpoint.");
+    }
 
+    const empty = [NOT_SPECIFIED];
     const r: Report = {
-      summary,
-      completed: completed.length ? completed : [`${NOT_SPECIFIED} — no completed work captured yet.`],
-      pending: pending.length ? pending : [`${NOT_SPECIFIED} — no pending items captured.`],
-      risks,
-      recommendations,
-      nextSteps,
+      executiveSummary,
+      completed: completed.length ? completed : empty,
+      inProgress: inProgress.length ? inProgress : empty,
+      pending: pending.length ? pending : empty,
+      risks: risksOut,
+      recommendations: dedupe(recommendations),
+      nextSteps: dedupe(nextSteps),
     };
+
+    // Strip duplicates that may appear across in-progress and pending due to overlapping cues.
+    r.pending = r.pending.filter((p) => !r.inProgress.includes(p));
+
+    // Used point sentences with no other home — append to in-progress only if it's empty.
+    if (r.inProgress[0] === NOT_SPECIFIED && points.length) {
+      r.inProgress = dedupe(points.slice(0, 4));
+    }
+
     setReport(r);
-    addOutput({ type: "Report", title: `${project.name} — status report` });
+    addOutput({ type: "Report", title: `${project?.name ?? "Project"} — status report` });
     toast.success("Report generated");
   };
 
   const copyReport = () => {
     if (!report) return;
     const text = [
-      `Summary: ${report.summary}`,
+      "Executive summary:",
+      report.executiveSummary,
       "",
-      "Completed:",
+      "Completed work:",
       ...report.completed.map((c) => ` - ${c}`),
       "",
-      "Pending:",
+      "Work in progress:",
+      ...report.inProgress.map((c) => ` - ${c}`),
+      "",
+      "Pending work:",
       ...report.pending.map((c) => ` - ${c}`),
       "",
       "Risks / blockers:",
@@ -159,9 +274,19 @@ function ReportsPage() {
             <div className="grid gap-2">
               <Label>Project</Label>
               <Select value={projectId} onValueChange={setProjectId}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectTrigger><SelectValue placeholder="None — use notes only" /></SelectTrigger>
                 <SelectContent>
                   {projects.map((p) => <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="grid gap-2">
+              <Label>Include real task data?</Label>
+              <Select value={useProjectData ? "yes" : "no"} onValueChange={(v) => setUseProjectData(v === "yes")}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="yes">Yes — enrich with tracked tasks</SelectItem>
+                  <SelectItem value="no">No — use only the notes below</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -197,8 +322,9 @@ function ReportsPage() {
               </div>
             ) : (
               <div className="space-y-5 text-sm">
-                <Section title="Progress summary"><p>{report.summary}</p></Section>
+                <Section title="Executive summary"><p>{report.executiveSummary}</p></Section>
                 <Section title="Completed work"><Ul items={report.completed} /></Section>
+                <Section title="Work in progress"><Ul items={report.inProgress} /></Section>
                 <Section title="Pending work"><Ul items={report.pending} /></Section>
                 <Section title="Risks & blockers"><Ul items={report.risks} /></Section>
                 <Section title="Recommendations"><Ul items={report.recommendations} /></Section>

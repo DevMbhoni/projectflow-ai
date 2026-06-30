@@ -15,12 +15,12 @@ import {
   NOT_SPECIFIED,
   splitSentences,
   classifySentences,
-  keywords,
   extractDeadline,
   extractOwner,
   toImperative,
-  inDays,
-  properNouns,
+  sentenceTopic,
+  naturalList,
+  dedupe,
 } from "@/lib/ai-helpers";
 
 export const Route = createFileRoute("/meeting-notes")({
@@ -33,11 +33,13 @@ export const Route = createFileRoute("/meeting-notes")({
   component: MeetingNotesPage,
 });
 
+interface ActionItem { task: string; owner: string; deadline: string }
 interface Summary {
   summary: string;
   keyPoints: string[];
   decisions: string[];
-  actionItems: { task: string; owner: string; deadline: string }[];
+  actionItems: ActionItem[];
+  risks: string[];
   followUps: string[];
 }
 
@@ -48,7 +50,7 @@ function MeetingNotesPage() {
   const [attendees, setAttendees] = useState("Alex Morgan, Sarah Kim, Diego Alvarez");
   const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
   const [notes, setNotes] = useState(
-    "Discussed homepage hero variants and CTA copy. Sarah will finalize the wireframes by Friday. Decided to ship the v2 navigation behind a feature flag. Diego raised concerns about API rate limits on the loyalty endpoints — needs follow-up with platform team next week.",
+    "Discussed homepage wireframes and mobile navigation. Sarah will finalize the wireframes by tomorrow afternoon. Decided to ship the v2 navigation behind a feature flag. Booking page is delayed because the loyalty API spec is still pending from the backend team. Diego will follow up with platform by Friday. Client update is due next Monday.",
   );
   const [out, setOut] = useState<Summary | null>(null);
 
@@ -58,64 +60,78 @@ function MeetingNotesPage() {
     const attendeeList = attendees.split(",").map((s) => s.trim()).filter(Boolean);
     const sentences = splitSentences(notes);
     const { decisions, actions, risks, points } = classifySentences(sentences);
-    const kw = keywords(notes, 6);
-    const mentioned = properNouns(notes).filter(
-      (n) => !attendeeList.some((a) => a.toLowerCase().includes(n.toLowerCase())),
-    );
     const project = projects.find((p) => p.id === projectId);
 
-    const topic =
-      kw.length > 0
-        ? kw.slice(0, 3).join(", ")
-        : sentences[0]?.slice(0, 60).toLowerCase() ?? "the agenda";
+    // Build a human summary from actual topic phrases (not bag-of-words).
+    const topicPool = dedupe(
+      [...points, ...decisions, ...actions]
+        .map(sentenceTopic)
+        .map((t) => t.replace(/\s+by\s+.*$/i, "")) // drop deadline tail from topic
+        .filter((t) => t.length > 4),
+      (s) => s,
+    ).slice(0, 4);
+
+    const attendeesPhrase = attendeeList.length
+      ? naturalList(attendeeList)
+      : "the team";
+    const titlePhrase = title.trim() ? ` "${title.trim()}"` : "";
+    const projectPhrase = project ? ` for ${project.name}` : "";
+
+    const topicSentence = topicPool.length
+      ? `The discussion covered ${naturalList(topicPool)}.`
+      : `The notes did not surface a clear set of discussion topics.`;
+
+    const counts: string[] = [];
+    if (decisions.length) counts.push(`${decisions.length} decision${decisions.length === 1 ? "" : "s"}`);
+    if (actions.length) counts.push(`${actions.length} action item${actions.length === 1 ? "" : "s"}`);
+    if (risks.length) counts.push(`${risks.length} risk${risks.length === 1 ? "" : "s"} or blocker${risks.length === 1 ? "" : "s"}`);
+    const countsPhrase = counts.length ? ` ${naturalList(counts)} were captured.` : "";
 
     const summary =
-      `On ${date || NOT_SPECIFIED}, ${attendeeList.length ? attendeeList.join(", ") : "the team"} met` +
-      `${title ? ` for "${title}"` : ""}${project ? ` (project: ${project.name})` : ""}. ` +
-      `Discussion focused on ${topic}. ` +
-      `${decisions.length} decision${decisions.length === 1 ? "" : "s"} were recorded, ` +
-      `${actions.length} action item${actions.length === 1 ? "" : "s"} captured, and ` +
-      `${risks.length} risk${risks.length === 1 ? "" : "s"} flagged for follow-up.`;
+      `On ${date || NOT_SPECIFIED}, ${attendeesPhrase} met${titlePhrase}${projectPhrase}. ` +
+      `${topicSentence}${countsPhrase}`;
 
-    const keyPoints =
-      points.length > 0
-        ? points.slice(0, 6)
-        : sentences.slice(0, 4);
+    // Key points: original wording, deduped, full sentences (no truncation).
+    const keyPoints = dedupe(points.length ? points : sentences.slice(0, 5)).slice(0, 6);
 
-    const actionItems = (actions.length ? actions : sentences.slice(0, 3)).slice(0, 6).map((s, i) => {
-      const owner =
-        extractOwner(s, attendeeList) ??
-        (mentioned[0] ? mentioned[0] : attendeeList[i % Math.max(attendeeList.length, 1)] ?? NOT_SPECIFIED);
-      const dl = extractDeadline(s) ?? inDays(3 + i * 2);
-      return { task: toImperative(s).slice(0, 160), owner, deadline: dl };
+    // Action items: only from sentences that actually look like actions.
+    const rawActions = dedupe(actions);
+    const actionItems: ActionItem[] = rawActions.slice(0, 8).map((s) => {
+      const owner = extractOwner(s, attendeeList) ?? NOT_SPECIFIED;
+      const deadline = extractDeadline(s) ?? NOT_SPECIFIED;
+      return { task: toImperative(s), owner, deadline };
     });
 
-    const followUps: string[] = [];
-    if (risks.length) {
-      followUps.push(
-        `Address the flagged ${risks.length === 1 ? "risk" : "risks"}: ${risks
-          .map((r) => r.slice(0, 90))
-          .join("; ")}.`,
-      );
-    }
-    if (mentioned.length) {
-      followUps.push(`Loop in ${mentioned.slice(0, 3).join(", ")} on the relevant action items.`);
-    }
-    if (decisions.length === 0) {
-      followUps.push("No clear decisions were captured — confirm intent with the group before the next sync.");
-    }
-    followUps.push(`Circulate this summary to ${attendeeList.length ? attendeeList.join(", ") : "attendees"} within 24 hours.`);
+    const riskList = dedupe(risks);
 
-    const summaryObj: Summary = {
+    // Recommendations grounded in what's actually in the notes.
+    const followUps: string[] = [];
+    if (actionItems.some((a) => a.owner === NOT_SPECIFIED)) {
+      followUps.push("Assign owners to any action items currently marked as Not specified.");
+    }
+    if (actionItems.some((a) => a.deadline === NOT_SPECIFIED)) {
+      followUps.push("Confirm deadlines for action items that don't yet have a date.");
+    }
+    if (riskList.length) {
+      followUps.push(`Address the ${riskList.length === 1 ? "blocker" : "blockers"} raised above before the next sync.`);
+    }
+    if (!decisions.length) {
+      followUps.push("No explicit decisions were captured — confirm intent with the group in writing.");
+    }
+    followUps.push(
+      `Circulate this summary to ${attendeeList.length ? naturalList(attendeeList) : "all attendees"} within 24 hours.`,
+    );
+
+    setOut({
       summary,
-      keyPoints,
-      decisions: decisions.length ? decisions : [`${NOT_SPECIFIED} — no explicit decisions detected in the notes.`],
+      keyPoints: keyPoints.length ? keyPoints : [NOT_SPECIFIED],
+      decisions: decisions.length ? dedupe(decisions) : [NOT_SPECIFIED],
       actionItems: actionItems.length
         ? actionItems
         : [{ task: NOT_SPECIFIED, owner: NOT_SPECIFIED, deadline: NOT_SPECIFIED }],
+      risks: riskList.length ? riskList : ["No risks or blockers identified in the notes."],
       followUps,
-    };
-    setOut(summaryObj);
+    });
     addOutput({ type: "Meeting Summary", title: `${title || "Meeting"} — ${date}` });
     toast.success("Summary generated");
   };
@@ -133,6 +149,9 @@ function MeetingNotesPage() {
       "",
       "Action items:",
       ...out.actionItems.map((a) => ` - ${a.task} (Owner: ${a.owner}, Due: ${a.deadline})`),
+      "",
+      "Risks / concerns:",
+      ...out.risks.map((r) => ` - ${r}`),
       "",
       "Follow-up recommendations:",
       ...out.followUps.map((f) => ` - ${f}`),
@@ -231,6 +250,11 @@ function MeetingNotesPage() {
                       </div>
                     ))}
                   </div>
+                </Section>
+                <Section title="Risks / concerns">
+                  <ul className="list-disc space-y-1 pl-5">
+                    {out.risks.map((k, i) => <li key={i}>{k}</li>)}
+                  </ul>
                 </Section>
                 <Section title="Follow-up recommendations">
                   <ul className="list-disc space-y-1 pl-5">
