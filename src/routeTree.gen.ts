@@ -9,8 +9,50 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as TasksRouteImport } from './routes/tasks'
+import { Route as ResponsibleAiRouteImport } from './routes/responsible-ai'
+import { Route as ReportsRouteImport } from './routes/reports'
+import { Route as ProjectsRouteImport } from './routes/projects'
+import { Route as MeetingNotesRouteImport } from './routes/meeting-notes'
+import { Route as EmailGeneratorRouteImport } from './routes/email-generator'
+import { Route as AiPlannerRouteImport } from './routes/ai-planner'
 import { Route as IndexRouteImport } from './routes/index'
 
+const TasksRoute = TasksRouteImport.update({
+  id: '/tasks',
+  path: '/tasks',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ResponsibleAiRoute = ResponsibleAiRouteImport.update({
+  id: '/responsible-ai',
+  path: '/responsible-ai',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ReportsRoute = ReportsRouteImport.update({
+  id: '/reports',
+  path: '/reports',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ProjectsRoute = ProjectsRouteImport.update({
+  id: '/projects',
+  path: '/projects',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const MeetingNotesRoute = MeetingNotesRouteImport.update({
+  id: '/meeting-notes',
+  path: '/meeting-notes',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const EmailGeneratorRoute = EmailGeneratorRouteImport.update({
+  id: '/email-generator',
+  path: '/email-generator',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AiPlannerRoute = AiPlannerRouteImport.update({
+  id: '/ai-planner',
+  path: '/ai-planner',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
@@ -19,28 +61,130 @@ const IndexRoute = IndexRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/ai-planner': typeof AiPlannerRoute
+  '/email-generator': typeof EmailGeneratorRoute
+  '/meeting-notes': typeof MeetingNotesRoute
+  '/projects': typeof ProjectsRoute
+  '/reports': typeof ReportsRoute
+  '/responsible-ai': typeof ResponsibleAiRoute
+  '/tasks': typeof TasksRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/ai-planner': typeof AiPlannerRoute
+  '/email-generator': typeof EmailGeneratorRoute
+  '/meeting-notes': typeof MeetingNotesRoute
+  '/projects': typeof ProjectsRoute
+  '/reports': typeof ReportsRoute
+  '/responsible-ai': typeof ResponsibleAiRoute
+  '/tasks': typeof TasksRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/ai-planner': typeof AiPlannerRoute
+  '/email-generator': typeof EmailGeneratorRoute
+  '/meeting-notes': typeof MeetingNotesRoute
+  '/projects': typeof ProjectsRoute
+  '/reports': typeof ReportsRoute
+  '/responsible-ai': typeof ResponsibleAiRoute
+  '/tasks': typeof TasksRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/'
+  fullPaths:
+    | '/'
+    | '/ai-planner'
+    | '/email-generator'
+    | '/meeting-notes'
+    | '/projects'
+    | '/reports'
+    | '/responsible-ai'
+    | '/tasks'
   fileRoutesByTo: FileRoutesByTo
-  to: '/'
-  id: '__root__' | '/'
+  to:
+    | '/'
+    | '/ai-planner'
+    | '/email-generator'
+    | '/meeting-notes'
+    | '/projects'
+    | '/reports'
+    | '/responsible-ai'
+    | '/tasks'
+  id:
+    | '__root__'
+    | '/'
+    | '/ai-planner'
+    | '/email-generator'
+    | '/meeting-notes'
+    | '/projects'
+    | '/reports'
+    | '/responsible-ai'
+    | '/tasks'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  AiPlannerRoute: typeof AiPlannerRoute
+  EmailGeneratorRoute: typeof EmailGeneratorRoute
+  MeetingNotesRoute: typeof MeetingNotesRoute
+  ProjectsRoute: typeof ProjectsRoute
+  ReportsRoute: typeof ReportsRoute
+  ResponsibleAiRoute: typeof ResponsibleAiRoute
+  TasksRoute: typeof TasksRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/tasks': {
+      id: '/tasks'
+      path: '/tasks'
+      fullPath: '/tasks'
+      preLoaderRoute: typeof TasksRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/responsible-ai': {
+      id: '/responsible-ai'
+      path: '/responsible-ai'
+      fullPath: '/responsible-ai'
+      preLoaderRoute: typeof ResponsibleAiRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/reports': {
+      id: '/reports'
+      path: '/reports'
+      fullPath: '/reports'
+      preLoaderRoute: typeof ReportsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/projects': {
+      id: '/projects'
+      path: '/projects'
+      fullPath: '/projects'
+      preLoaderRoute: typeof ProjectsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/meeting-notes': {
+      id: '/meeting-notes'
+      path: '/meeting-notes'
+      fullPath: '/meeting-notes'
+      preLoaderRoute: typeof MeetingNotesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/email-generator': {
+      id: '/email-generator'
+      path: '/email-generator'
+      fullPath: '/email-generator'
+      preLoaderRoute: typeof EmailGeneratorRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/ai-planner': {
+      id: '/ai-planner'
+      path: '/ai-planner'
+      fullPath: '/ai-planner'
+      preLoaderRoute: typeof AiPlannerRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/': {
       id: '/'
       path: '/'
@@ -53,6 +197,13 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  AiPlannerRoute: AiPlannerRoute,
+  EmailGeneratorRoute: EmailGeneratorRoute,
+  MeetingNotesRoute: MeetingNotesRoute,
+  ProjectsRoute: ProjectsRoute,
+  ReportsRoute: ReportsRoute,
+  ResponsibleAiRoute: ResponsibleAiRoute,
+  TasksRoute: TasksRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
